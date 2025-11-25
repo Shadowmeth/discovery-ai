@@ -6,3 +6,5 @@ functions-framework
 pillow
 PyPDF2
 python-docx
+python-pptx
+openpyxl
