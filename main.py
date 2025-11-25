@@ -30,7 +30,7 @@ LOCAL_LOG_DIR = "/tmp"
 LOCAL_LOG_PATH = "/tmp/logs.txt"
 LOG_FOLDER = "logs"
 LOG_FILE_NAME = "logs.txt"
-#LOG_BUCKET_NAME = "discovery-processed"
+LOG_BUCKET_NAME = "discovery-processed"
 
 # init the clients
 PROJECT_ID = os.environ.get("GCP_PROJECT")
@@ -90,49 +90,68 @@ def analyze_discovery_material_ce(ce: CloudEvent):
 
         logger.info("To be continued! :)")
 
-
 def transcribe_gcs(gcs_uri: str) -> str:
     """
-    Uses Speech-to-Text v2 API to transcribe audio from GCS.
+    Uses Speech-to-Text v2 API to transcribe audio from GCS (any length).
     Returns the full transcript as string.
-    Requires a recognizer resource to be created beforehand.
+    Uses batch_recognize for long-running transcription.
     """
     api_endpoint = "us-west1-speech.googleapis.com"
     client_options = ClientOptions(api_endpoint=api_endpoint)
-    client = speech.SpeechClient(
-        client_options=client_options
-    )
+    client = speech.SpeechClient(client_options=client_options)
 
-    request = speech.RecognizeRequest(
-        recognizer=f"projects/{PROJECT_ID}/locations/us-west1/recognizers/my-recognizer",
-        config=speech.RecognitionConfig(
-            auto_decoding_config={},  # auto detect encoding
-            language_codes=["en-US"],
-            features=speech.RecognitionFeatures(enable_automatic_punctuation=True),
-            model="long",
+    # Configure recognition
+    config = speech.RecognitionConfig(
+        auto_decoding_config=speech.AutoDetectDecodingConfig(),
+        language_codes=["en-US"],
+        model="long",  # Use long model for better accuracy on longer audio
+        features=speech.RecognitionFeatures(
+            enable_automatic_punctuation=True
         ),
-        uri=gcs_uri,
     )
 
-    response = client.recognize(request=request)
+    # Create file metadata for batch recognition
+    file_metadata = speech.BatchRecognizeFileMetadata(uri=gcs_uri)
 
-    transcript = "\n".join(
-        [result.alternatives[0].transcript for result in response.results]
+    # Create the batch recognize request
+    request = speech.BatchRecognizeRequest(
+        recognizer=f"projects/{PROJECT_ID}/locations/us-west1/recognizers/my-recognizer",
+        config=config,
+        files=[file_metadata],
+        recognition_output_config=speech.RecognitionOutputConfig(
+            inline_response_config=speech.InlineOutputConfig(),
+        ),
     )
+
+    # Start the long-running operation
+    logger.info(f"Starting transcription for {gcs_uri}...")
+    operation = client.batch_recognize(request=request)
+    
+    # Wait for completion (timeout after 30 minutes for very long audio)
+    response = operation.result(timeout=1800)
+    
+    # Extract transcript from response
+    transcript_parts = []
+    if gcs_uri in response.results:
+        for result in response.results[gcs_uri].transcript.results:
+            if result.alternatives:
+                transcript_parts.append(result.alternatives[0].transcript)
+    
+    transcript = " ".join(transcript_parts)
     return transcript.strip()
 
 
 def speech_to_text(ce: CloudEvent):
     """
-    Wrapper around v2 API that saves transcript in discovery-processed bucket,
+    Wrapper around v2 API that saves transcript in the same bucket,
     preserving folder structure.
     """
     event_data = ce.data
     file_name = event_data.get("name")
     bucket_name = event_data.get("bucket")
-
+    
     ext = get_file_extension(file_name)
-    if ext not in (".mp3", ".wav", ".flac", ".m4a", ".mkv", "mov", ".avi" ".ogg", ".aac"):
+    if ext not in (".mp3", ".wav", ".flac", ".m4a", ".mkv", ".mov", ".avi", ".ogg", ".aac"):
         logger.info(f"Skipping speech-to-text: unsupported file type '{ext}'")
         return
 
@@ -143,24 +162,36 @@ def speech_to_text(ce: CloudEvent):
         transcript = transcribe_gcs(gcs_uri)
         if not transcript:
             transcript = "[No transcription available]"
+        
+        # Extract directory path WITHOUT filename
+        file_dir = get_file_path(file_name)
 
-        # Save transcript to bucket, same folder structure
-        processed_blob_name = f"{os.path.splitext(file_name)[0]}.txt"
-        dest_blob = storage_client.bucket(OUTPUT_BUCKET).blob(processed_blob_name)
-        tmp_path = f"/tmp/{os.path.basename(processed_blob_name)}"
-        with open(tmp_path, "w") as f:
+        # Build final transcript path
+        base_name = os.path.splitext(os.path.basename(file_name))[0]
+        transcript_blob_name = f"{file_dir}/speech_to_text_transcripts/{base_name}.txt"
+        
+        # Ensure "folder" exists
+        create_folder(bucket_name, f"{file_dir}/speech_to_text_transcripts")
+        
+        # Temp save local .txt
+        tmp_path = f"/tmp/{os.path.basename(transcript_blob_name)}"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(transcript)
 
+        # Upload to SAME bucket
+        dest_blob = storage_client.bucket(bucket_name).blob(transcript_blob_name)
         dest_blob.upload_from_filename(tmp_path, content_type="text/plain")
-        logger.info(
-            f"📝 Uploaded transcription to gs://{OUTPUT_BUCKET}/{processed_blob_name}"
-        )
-        gcs_log(f"Transcribed {gcs_uri} → gs://{OUTPUT_BUCKET}/{processed_blob_name}")
+
+        logger.info(f"📝 Transcript uploaded to gs://{bucket_name}/{transcript_blob_name}")
+        gcs_log(f"Transcribed {gcs_uri} → gs://{bucket_name}/{transcript_blob_name}")
+        
+        # Clean up temp file
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
     except Exception as e:
         logger.exception(f"❌ Speech-to-text v2 failed for {gcs_uri}: {e}")
         gcs_log(f"Speech-to-text failed for {gcs_uri}: {e}", severity="ERROR")
-
 
 def get_file_path(file_name):
     """
